@@ -1,0 +1,71 @@
+# ============================================================
+# STAGE 1: Spectrogram + Radon Detection
+# Input:  h (EMRI waveform), dt (sample interval in seconds)
+# Output: f_candidates (list of candidate harmonic frequencies in mHz)
+# ============================================================
+
+from scipy.signal import spectrogram, find_peaks
+from scipy.ndimage import uniform_filter1d
+from skimage.transform import radon
+import numpy as np
+import matplotlib.pyplot as plt
+
+# Compute spectrogram
+f, t_spec, Sxx = spectrogram(h.real, fs=1/dt,
+                              nperseg=8192, noverlap=4096)
+f_mHz = f * 1e3
+mask = (f_mHz > 0.1) & (f_mHz < 10)
+Sxx_band = Sxx[mask]
+f_band = f_mHz[mask]
+t_days = t_spec / 3600 / 24
+
+# Normalize for Radon
+img = np.log10(Sxx_band + 1e-30)
+img = (img - img.min()) / (img.max() - img.min())
+
+# Radon transform
+angles = np.linspace(85, 95, 500)
+sinogram = radon(img, theta=angles)
+radon_power = sinogram.sum(axis=0)
+peak_angle = angles[np.argmax(radon_power)]
+
+# Extract 1D profile at peak angle
+sino_at_peak = sinogram[:, np.argmax(radon_power)]
+sino_f_axis = np.linspace(f_band[0], f_band[-1], len(sino_at_peak))
+
+# Background-normalized peak finding
+background = uniform_filter1d(sino_at_peak, size=50)
+sino_normalized = sino_at_peak / (background + 1e-10)
+peaks, _ = find_peaks(sino_normalized, height=1.02, distance=5)
+f_candidates = sino_f_axis[peaks]
+
+print(f"Peak Radon angle: {peak_angle:.3f} degrees")
+print(f"Candidate tracks found: {len(peaks)}")
+for i, fc in enumerate(f_candidates):
+    print(f"  Track {i+1}: {fc:.4f} mHz")
+
+# Plot
+fig, axes = plt.subplots(1, 3, figsize=(16, 5))
+
+axes[0].pcolormesh(t_days, f_band, img, shading='auto', cmap='inferno')
+axes[0].set_xlabel('Time (days)')
+axes[0].set_ylabel('Frequency (mHz)')
+axes[0].set_title('Spectrogram')
+
+axes[1].imshow(sinogram, aspect='auto', origin='lower', cmap='inferno',
+               extent=[angles[0], angles[-1], f_band[0], f_band[-1]])
+axes[1].set_xlabel('Angle (degrees)')
+axes[1].set_ylabel('Frequency (mHz)')
+axes[1].set_title('Radon sinogram')
+
+axes[2].plot(sino_normalized, sino_f_axis, 'steelblue', lw=0.8)
+axes[2].scatter(sino_normalized[peaks], f_candidates,
+                color='tomato', zorder=5, s=50,
+                label=f'{len(peaks)} candidates')
+axes[2].set_xlabel('Normalized Radon power')
+axes[2].set_ylabel('Frequency (mHz)')
+axes[2].set_title('Candidate tracks (Radon peaks)')
+axes[2].legend()
+
+plt.tight_layout()
+plt.show()
