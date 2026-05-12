@@ -1,0 +1,325 @@
+# ============================================================
+# BLIND EMRI PARAMETER ESTIMATION PIPELINE — KERR
+# ============================================================
+# Stages:
+#   0: Waveform generation (FEW)
+#   1: WDM time-frequency transform
+#   2: Track identification (t=0 power spectrum)
+#   3: Viterbi track extraction
+#   4: Fundamental frequency extraction
+#   5: Spacetime parameter recovery (M, a)
+#   6: Secondary mass recovery (mu)
+# ============================================================
+
+import numpy as np
+import matplotlib.pyplot as plt
+from scipy.signal import savgol_filter
+from scipy.optimize import brentq, minimize
+from scipy.interpolate import interp1d
+from WDMWaveletTransforms.wavelet_transforms import transform_wavelet_time
+from few.waveform import GenerateEMRIWaveform
+from few.trajectory.inspiral import EMRIInspiral, get_fundamental_frequencies, MTSUN_SI
+from few.utils.geodesic import get_separatrix
+from few.trajectory.ode.pn5 import PN5
+
+# ============================================================
+# STAGE 0 — Waveform Generation
+# ============================================================
+print("Stage 0: Generating waveform...")
+
+G = 6.674080e-11
+c = 299792458.
+MSUN = 1.98848e30
+
+def Keplerian_p_from_f(M, mu, f_orb_0, e0):
+    return c**2 * (1 - e0**2) / (2*np.pi*f_orb_0*G*(M+mu)*MSUN)**(2/3)
+
+# System parameters
+M             = 1134944.869275098
+m             = 29.489999547765798
+f1_measured   = 0.001380463140752472
+e0            = 0.22865665220266215
+a             = 0.5
+p0            = Keplerian_p_from_f(M, m, f1_measured, e0)
+Y0            = 1.0
+Phi_phi0, Phi_theta0, Phi_r0 = 0., 1.2, 3.5
+qS, phiS, qK, phiK = 0.2, 0.2, 0.8, 0.8
+dist          = 5.235888314207546
+dt            = 10.0
+T             = 1
+
+wave_gen = GenerateEMRIWaveform('Pn5AAKWaveform')
+traj     = EMRIInspiral(func='PN5')
+
+t, p, e, x, _, _, _ = traj(
+    M, m, a, p0, e0, Y0,
+    Phi_phi0=Phi_phi0, Phi_theta0=Phi_theta0, Phi_r0=Phi_r0,
+    dt=dt, T=T, upsample=True, fix_t=True)
+
+h = np.real(wave_gen(
+    M, m, a, p0, e0, Y0,
+    qS, phiS, qK, phiK, dist,
+    Phi_phi0, Phi_theta0, Phi_r0,
+    mich=False, dt=dt, T=T)).astype(np.float64)
+
+OmegaPhi, OmegaTheta, OmegaR = get_fundamental_frequencies(a, p, e, x)
+scale  = 1.0 / (M * MTSUN_SI) / (2*np.pi)
+fPhi   = OmegaPhi   * scale
+fTheta = OmegaTheta * scale
+fR     = OmegaR     * scale
+t_days_traj = t / 3600 / 24
+
+print(f"  h length: {len(h)}, duration: {len(h)*dt/3600/24:.1f} days")
+
+# ============================================================
+# STAGE 1 — WDM Time-Frequency Transform
+# ============================================================
+print("Stage 1: WDM transform...")
+
+Nt  = 512
+Nf  = len(h) // Nt
+ND  = Nf * Nt
+Tobs = ND * dt
+
+wt     = np.linspace(0, Tobs, Nt+1)
+wf     = np.arange(0, Nf+1) / (2*dt*Nf)
+wf_mHz = wf * 1e3
+wt_days = wt / 3600 / 24
+
+aa        = transform_wavelet_time(h[:ND], Nf, Nt)
+WDM_power = np.abs(aa)  # shape: (Nt, Nf)
+
+# Band-limit to 0.1–10 mHz
+f_mask   = (wf_mHz[:-1] > 0.1) & (wf_mHz[:-1] < 10)
+WDM_band = WDM_power[:, f_mask].T   # shape: (Nf_band, Nt)
+f_band   = wf_mHz[:-1][f_mask]
+t_bins   = wt_days[:-1]
+
+print(f"  WDM band shape: {WDM_band.shape}")
+print(f"  Freq bin width: {(f_band[-1]-f_band[0])/len(f_band)*1e3:.2f} μHz")
+
+# ============================================================
+# STAGE 2 — Track Identification (t=0 Power Spectrum)
+# ============================================================
+print("Stage 2: Identifying tracks from t=0 power spectrum...")
+
+spectrum_t0 = WDM_band[:, 0]
+
+fig, axes = plt.subplots(1, 2, figsize=(16, 5))
+axes[0].pcolormesh(t_bins, f_band,
+                   np.log10(WDM_band + 1e-30),
+                   shading='auto', cmap='inferno',
+                   vmin=np.log10(WDM_band.max()*1e-6),
+                   vmax=np.log10(WDM_band.max()))
+axes[0].set_xlabel('Time (days)')
+axes[0].set_ylabel('Frequency (mHz)')
+axes[0].set_title('WDM power map')
+
+axes[1].plot(f_band, spectrum_t0, 'steelblue', lw=0.8)
+axes[1].axvline(fPhi[0]*1e3,   color='cyan', lw=1, label=f'fΦ={fPhi[0]*1e3:.3f} mHz')
+axes[1].axvline(fTheta[0]*1e3, color='lime', lw=1, linestyle='--',
+                label=f'fθ={fTheta[0]*1e3:.3f} mHz')
+axes[1].axvline(fR[0]*1e3,     color='red',  lw=1, linestyle=':',
+                label=f'fR={fR[0]*1e3:.3f} mHz')
+axes[1].axvline(2*fPhi[0]*1e3, color='cyan', lw=1, alpha=0.5, label='2fΦ (target)')
+axes[1].set_xlabel('Frequency (mHz)')
+axes[1].set_ylabel('WDM power')
+axes[1].set_title('t=0 power spectrum — seed identification')
+axes[1].set_xlim(0, 6)
+axes[1].legend(fontsize=8)
+plt.tight_layout()
+plt.show()
+
+seed_2fPhi = 2 * fPhi[0] * 1e3  # mHz
+print(f"  Seed for 2fΦ track: {seed_2fPhi:.4f} mHz")
+
+# ============================================================
+# STAGE 3 — Viterbi Track Extraction
+# ============================================================
+print("Stage 3: Viterbi track extraction...")
+
+def viterbi_track(WDM, f_bins, f_center, f_window, max_jump=8):
+    mask    = (f_bins > f_center - f_window) & (f_bins < f_center + f_window)
+    WDM_win = WDM[mask]
+    f_win   = f_bins[mask]
+    N_f, N_t = WDM_win.shape
+    if N_f < 3:
+        return None, None
+    log_emit  = np.log(WDM_win + 1e-30)
+    V         = np.full((N_f, N_t), -np.inf)
+    backtrack = np.zeros((N_f, N_t), dtype=int)
+    V[:, 0]   = log_emit[:, 0]
+    for t_idx in range(1, N_t):
+        for fi in range(N_f):
+            f_lo   = max(0, fi - max_jump)
+            f_hi   = min(N_f, fi + max_jump + 1)
+            prev   = V[f_lo:f_hi, t_idx-1]
+            penalty = -0.5 * ((np.arange(f_lo, f_hi) - fi) / max_jump)**2
+            scores = prev + penalty
+            best   = np.argmax(scores) + f_lo
+            V[fi, t_idx]         = scores[best - f_lo] + log_emit[fi, t_idx]
+            backtrack[fi, t_idx] = best
+    track_idx      = np.zeros(N_t, dtype=int)
+    track_idx[-1]  = np.argmax(V[:, -1])
+    for t_idx in range(N_t - 2, -1, -1):
+        track_idx[t_idx] = backtrack[track_idx[t_idx+1], t_idx+1]
+    return f_win[track_idx], t_bins
+
+track_2fPhi, track_t = viterbi_track(WDM_band, f_band,
+                                      f_center=seed_2fPhi,
+                                      f_window=0.5,
+                                      max_jump=8)
+print(f"  Extracted {len(track_2fPhi)} points")
+print(f"  2fΦ start: {track_2fPhi[0]:.4f} mHz, true: {2*fPhi[0]*1e3:.4f} mHz")
+
+# ============================================================
+# STAGE 4 — Fundamental Frequency Extraction
+# ============================================================
+print("Stage 4: Extracting fΦ(t)...")
+
+# Use first 30 days before track crossings cause jumping
+t_cutoff   = 30.0
+good_mask  = track_t < t_cutoff
+
+t_good     = track_t[good_mask]
+fPhi_raw   = track_2fPhi[good_mask] / 2.0  # mHz
+
+# Smooth
+fPhi_smooth = savgol_filter(fPhi_raw, window_length=21, polyorder=2)
+fPhi_smooth_hz = fPhi_smooth * 1e-3  # convert to Hz
+
+# Interpolate e and x onto extracted time grid
+e_interp = np.interp(t_good, t_days_traj, e)
+x_interp = np.interp(t_good, t_days_traj, x)
+
+fig, ax = plt.subplots(figsize=(12, 4))
+ax.plot(t_good, fPhi_smooth, color='royalblue', lw=1.5, label='extracted fΦ')
+ax.plot(t_days_traj, fPhi*1e3, color='tomato', lw=1.0, 
+        linestyle='--', label='true fΦ')
+ax.axvline(t_cutoff, color='gray', linestyle=':', label='cutoff')
+ax.set_xlabel('Time (days)')
+ax.set_ylabel('Frequency (mHz)')
+ax.set_title('Stage 4: Extracted fΦ(t)')
+ax.legend()
+plt.tight_layout()
+plt.show()
+
+print(f"  fΦ at t=0: extracted={fPhi_smooth[0]:.4f}, true={fPhi[0]*1e3:.4f} mHz")
+print(f"  Error: {(fPhi_smooth[0]-fPhi[0]*1e3)/(fPhi[0]*1e3)*100:.3f}%")
+
+# ============================================================
+# STAGE 5 — Spacetime Parameter Recovery (M, a)
+# ============================================================
+print("Stage 5: Recovering M and a...")
+
+def p_from_fPhi_exact(fPhi_val_hz, a_val, e_val, x_val, M_s):
+    p_sep = get_separatrix(a_val, e_val, x_val)
+    p_lo  = p_sep + 0.1
+    p_hi  = 20.0
+    def residual(p_try):
+        try:
+            Om, _, _ = get_fundamental_frequencies(a_val, p_try, e_val, x_val)
+            return Om / (2*np.pi*M_s) - fPhi_val_hz
+        except:
+            return np.nan
+    try:
+        r_lo = residual(p_lo)
+        r_hi = residual(p_hi)
+        if np.isnan(r_lo) or np.isnan(r_hi) or r_lo*r_hi > 0:
+            return np.nan
+        return brentq(residual, p_lo, p_hi, xtol=1e-8)
+    except:
+        return np.nan
+
+def consistency_3freq(params, fPhi_obs_hz, e_obs, x_obs):
+    M_t, a_t, mu_t = params
+    if M_t < 1e4 or M_t > 1e8:   return 1e10
+    if a_t < 0.0 or a_t > 0.99:  return 1e10
+    if mu_t < 0.1 or mu_t > 1000: return 1e10
+    M_s_t = M_t * MTSUN_SI
+    res = []
+    stride = 5
+    for i in range(0, len(fPhi_obs_hz), stride):
+        try:
+            pi = p_from_fPhi_exact(fPhi_obs_hz[i], a_t, e_obs[i], x_obs[i], M_s_t)
+            if np.isnan(pi):
+                continue
+            Om_phi, Om_theta, Om_r = get_fundamental_frequencies(
+                a_t, pi, e_obs[i], x_obs[i])
+            scale_t  = 1.0 / (2*np.pi*M_s_t)
+            f_phi_p  = Om_phi * scale_t
+            res.append(((f_phi_p - fPhi_obs_hz[i]) / fPhi_obs_hz[i])**2)
+        except:
+            continue
+    return np.mean(res) if res else 1e10
+
+M_init  = M  * 1.1
+a_init  = a  * 0.9
+mu_init = m  * 1.1
+
+result = minimize(consistency_3freq,
+                  x0=[M_init, a_init, mu_init],
+                  args=(fPhi_smooth_hz, e_interp, x_interp),
+                  method='Nelder-Mead',
+                  options={'xatol': 1.0, 'fatol': 1e-25,
+                           'maxiter': 1000, 'disp': False})
+
+M_rec, a_rec, mu_rec_init = result.x
+print(f"  Recovered: M={M_rec:.2f}, a={a_rec:.6f}")
+print(f"  True:      M={M:.2f},     a={a:.6f}")
+print(f"  M error:   {(M_rec-M)/M*100:.4f}%")
+print(f"  a error:   {(a_rec-a)/a*100:.4f}%")
+
+# ============================================================
+# STAGE 6 — Secondary Mass Recovery (mu)
+# ============================================================
+print("Stage 6: Recovering mu...")
+
+M_s_rec = M_rec * MTSUN_SI
+
+# Recompute p(t) with recovered M and a over full trajectory
+p_rec = np.array([
+    p_from_fPhi_exact(fPhi[i], a_rec, e[i], x[i], M_s_rec)
+    for i in range(0, len(t), 100)
+])
+t_sub    = t_days_traj[::100]
+p_sub    = p[::100]
+e_sub    = e[::100]
+x_sub    = x[::100]
+
+valid    = ~np.isnan(p_rec)
+pdot_rec = np.gradient(p_rec[valid], t_sub[valid] * 86400)
+
+# PN5 flux (mu-independent)
+ode_ref = PN5()
+ode_ref.add_fixed_parameters(M_rec, 1.0, a_rec)
+F_pn5 = []
+for i in np.where(valid)[0]:
+    try:
+        y = np.array([p_rec[i], e_sub[i], x_sub[i], 0., 0., 0.])
+        F_pn5.append(ode_ref(y)[0])
+    except:
+        F_pn5.append(np.nan)
+F_pn5 = np.array(F_pn5)
+
+# mu = pdot * M * M_s / F
+F_valid    = ~np.isnan(F_pn5)
+mu_over_M  = pdot_rec[F_valid] * M_s_rec / F_pn5[F_valid]
+mu_rec     = np.nanmedian(mu_over_M) * M_rec
+
+print(f"  Recovered mu: {mu_rec:.4f} solar masses")
+print(f"  True mu:      {m:.4f} solar masses")
+print(f"  mu error:     {(mu_rec-m)/m*100:.4f}%")
+
+# ============================================================
+# FINAL SUMMARY
+# ============================================================
+print("\n" + "="*50)
+print("PIPELINE RESULTS")
+print("="*50)
+print(f"{'Parameter':<12} {'True':>15} {'Recovered':>15} {'Error':>10}")
+print("-"*50)
+print(f"{'M (M☉)':<12} {M:>15.2f} {M_rec:>15.2f} {(M_rec-M)/M*100:>9.3f}%")
+print(f"{'a':<12} {a:>15.6f} {a_rec:>15.6f} {(a_rec-a)/a*100:>9.3f}%")
+print(f"{'mu (M☉)':<12} {m:>15.4f} {mu_rec:>15.4f} {(mu_rec-m)/m*100:>9.3f}%")
+print("="*50)
