@@ -1,0 +1,22 @@
+# Jupyter
+.ipynb_checkpoints/
+**/.ipynb_checkpoints/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.env
+.venv/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Large / personal files
+*.fits
+*.h5
+*.hdf5
+Miniconda3*.sh
+get-pip.py
+miniconda3/
